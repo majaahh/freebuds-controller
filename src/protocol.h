@@ -9,11 +9,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
-typedef struct
-{
-    uint8_t *data;
-    size_t len;
-    size_t cap;
+typedef struct {
+  uint8_t *data;
+  size_t len;
+  size_t cap;
 } fb_buf;
 
 void fb_buf_init(fb_buf *b);
@@ -119,16 +118,14 @@ void fb_mac_to_bytes(const char *mac, uint8_t out[6]);
 void fb_mac_to_str(const uint8_t *raw, char *out);
 int fb_valid_mac(const char *mac);
 
-typedef struct
-{
-    const char *key;
-    const char *alias;
+typedef struct {
+  const char *key;
+  const char *alias;
 } fb_strpair;
 
-typedef struct
-{
-    const char *name;
-    int value;
+typedef struct {
+  const char *name;
+  int value;
 } fb_ival;
 
 /* gesture/action tables */
@@ -146,18 +143,17 @@ int fb_resolve_anc_level(const char *s, int *out);
 int fb_resolve_eq_mode(const char *s, int *out);
 int fb_gesture_from_alias(const char *alias);
 
-typedef struct
-{
-    const char *key;
-    const char *name;
-    const uint8_t *get;
-    size_t get_len;
-    const uint8_t *set_prefix;
-    size_t set_prefix_len;
-    int svc;
-    int cmd;
-    int set_cmd;
-    int nc_action;
+typedef struct {
+  const char *key;
+  const char *name;
+  const uint8_t *get;
+  size_t get_len;
+  const uint8_t *set_prefix;
+  size_t set_prefix_len;
+  int svc;
+  int cmd;
+  int set_cmd;
+  int nc_action;
 } fb_gesture;
 
 extern const fb_gesture FB_GESTURES[6];
@@ -167,18 +163,17 @@ const char *fb_gesture_name(int g);
 const char *fb_gesture_lp_name(void);
 int fb_gesture_nc_action(int g);
 
-typedef struct
-{
-    const char *key;
-    const char *name;
-    const char *get_name_label;
-    const uint8_t *get;
-    size_t get_len;
-    const uint8_t *set;
-    size_t set_len;
-    int svc;
-    int cmd;
-    int set_cmd;
+typedef struct {
+  const char *key;
+  const char *name;
+  const char *get_name_label;
+  const uint8_t *get;
+  size_t get_len;
+  const uint8_t *set;
+  size_t set_len;
+  int svc;
+  int cmd;
+  int set_cmd;
 } fb_feature;
 
 extern const fb_feature FB_FEATURABLE[14];

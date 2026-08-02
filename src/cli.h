@@ -8,18 +8,16 @@
 
 #include "controller.h"
 
-typedef struct
-{
-    char name[128];
-    char address[32];
-    int rssi;
-    int has_rssi;
+typedef struct {
+  char name[128];
+  char address[32];
+  int rssi;
+  int has_rssi;
 } fb_scan_entry;
 
-typedef struct
-{
-    fb_scan_entry *items;
-    size_t count;
+typedef struct {
+  fb_scan_entry *items;
+  size_t count;
 } fb_scan_results;
 
 void fb_scan_freebuds(fb_scan_results *out, int scan_time);
