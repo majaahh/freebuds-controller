@@ -317,6 +317,24 @@ class Cmd:
     GET_CONNECT_ABILITY = bytes([0x2B, 0x2D, 0x01, 0x00])
     QUERY_PAIR = bytes([0x2B, 0x8F, 0x01, 0x00])
     STATE_PAIR = bytes([0x2B, 0x90, 0x01, 0x01, 0x01])
+    GET_DEVICES_BONDED = bytes([0x2B, 0x31, 0x01, 0x00])
+
+    @staticmethod
+    def get_bonded_by_index(index: int) -> bytes:
+        return bytes([0x2B, 0x31, 0x03, 0x01, index & 0xFF])
+
+    @staticmethod
+    def get_bonded_by_mac(mac: bytes) -> bytes:
+        return bytes([0x2B, 0x31, 0x04, 0x06]) + mac
+
+    @staticmethod
+    def set_primary_device(mac: bytes) -> bytes:
+        return bytes([0x2B, 0x32, 0x01, 0x06]) + mac
+
+    @staticmethod
+    def single_device_setting(sub: int, mac: bytes) -> bytes:
+        return bytes([0x2B, 0x33, sub & 0xFF, 0x06]) + mac
+
     GET_FIT_CHECK = bytes([0x2B, 0x26, 0x01, 0x00])
     EXIT_FIT_CHECK = bytes([0x2B, 0x26, 0x03, 0x00])
     GET_FIT_DETECT_VERSION = bytes([0x2B, 0x37, 0x01, 0x00])
@@ -511,7 +529,7 @@ def resolve_eq_mode(value) -> Optional[int]:
 _CMD_NAMES = {
     "help", "bat", "ver", "info",
     "gesture", "anc", "nc", "sfx", "lang", "raw", "misc",
-    "lp", "sp", "slide", "dc", "triple", "pinch", "lhold",
+    "lp", "sp", "slide", "dc", "triple", "pinch", "lhold", "devices", "dev",
 }  # fmt: skip
 
 GESTURE_TYPES = {
@@ -733,6 +751,16 @@ def parse_tlv(data: bytes) -> list[dict]:
         entries.append({"tag": tag, "len": length, "value": value})
         pos += 2 + length
     return entries
+
+
+def mac_to_bytes(mac: str) -> bytes:
+    return bytes.fromhex(mac.replace(":", "").replace("-", ""))
+
+
+def mac_to_str(raw: bytes) -> str:
+    if len(raw) != 6:
+        return raw.hex()
+    return ":".join(f"{b:02X}" for b in raw)
 
 
 class FreeBudsController:
@@ -1579,6 +1607,173 @@ class FreeBudsController:
             "Connect ability",
         )
 
+    def _parse_bonded_device(self, data: bytes) -> dict:
+        dev = {}
+        for tlv in parse_tlv(data):
+            v = tlv["value"]
+            tag = tlv["tag"]
+            if tag == 2 and len(v) == 1:
+                dev["number"] = v[0]
+            elif tag == 3 and len(v) == 1:
+                dev["index"] = v[0]
+            elif tag == 4 and len(v) == 6:
+                dev["addr"] = mac_to_str(v)
+                dev["byte_addr"] = v
+            elif tag == 5 and len(v) == 1:
+                dev["conn_state"] = v[0] & 1
+                dev["business_state"] = (v[0] & 0x0E) >> 1
+                dev["in_business"] = ((v[0] & 0x0E) >> 1) > 1
+            elif tag == 6 and len(v) == 1:
+                dev["type"] = v[0]
+            elif tag == 7 and len(v) == 1:
+                dev["primary"] = v[0]
+            elif tag == 8 and len(v) == 1:
+                dev["back_conn_permit"] = v[0]
+            elif tag == 9 and v:
+                dev["name"] = v.decode("utf-8", errors="ignore").strip().rstrip("\x00")
+            elif tag == 10 and len(v) == 1:
+                dev["allow_audio_auto_switch"] = v[0] == 1
+            elif tag == 11 and len(v) == 1:
+                dev["nearlink"] = v[0] == 1
+            elif tag in (13, 15) and len(v) == 1:
+                dev["lock_channel"] = v[0] == 1
+        return dev
+
+    def _parse_device_report(self, data: bytes) -> dict:
+        rep = {}
+        for tlv in parse_tlv(data):
+            v = tlv["value"]
+            tag = tlv["tag"]
+            rep["type"] = tag
+            if tag == 1:
+                rep["indices"] = [b for b in v if b != 0xFF]
+            elif tag == 2 and len(v) == 6:
+                rep["addr"] = mac_to_str(v)
+            elif tag == 3 and len(v) == 1:
+                rep["flag"] = v[0] == 1
+            elif tag == 4 and len(v) == 6:
+                rep["byte_addr"] = v
+                rep["addr"] = mac_to_str(v)
+            elif tag == 5 and len(v) == 7:
+                rep["addr"] = mac_to_str(v[:6])
+                rep["conn_state"] = v[6] & 1
+                rep["business_state"] = (v[6] & 0x0E) >> 1
+                rep["in_business"] = ((v[6] & 0x0E) >> 1) > 1
+            elif tag == 6 and len(v) == 7:
+                rep["addr"] = mac_to_str(v[:6])
+                rep["back_conn_permit"] = v[6]
+            elif tag == 7 and len(v) == 6:
+                rep["addr"] = mac_to_str(v)
+            elif tag == 8 and len(v) == 7:
+                rep["addr"] = mac_to_str(v[:6])
+                rep["allow_audio_auto_switch"] = v[6] == 1
+            elif tag == 9 and len(v) == 7:
+                rep["addr"] = mac_to_str(v[:6])
+                rep["lock_channel"] = v[6] == 1
+        return rep
+
+    def get_bonded_devices(self, timeout: float = 2.0) -> list[dict]:
+        frames = self.send_command(Cmd.GET_DEVICES_BONDED, timeout)
+        devices = {}
+        for f in frames:
+            if f["svc"] != 0x2B:
+                continue
+            if f["cmd"] == 0x31:
+                dev = self._parse_bonded_device(f["data"])
+                if dev.get("addr"):
+                    devices[dev["addr"]] = dev
+            elif f["cmd"] == 0x36:
+                rep = self._parse_device_report(f["data"])
+                addr = rep.get("addr")
+                if not addr or addr not in devices:
+                    continue
+                dev = devices[addr]
+                if rep.get("type") == 5:
+                    dev["conn_state"] = rep["conn_state"]
+                    dev["business_state"] = rep.get("business_state")
+                    dev["in_business"] = rep.get("in_business", False)
+                elif rep.get("type") == 6:
+                    dev["back_conn_permit"] = rep["back_conn_permit"]
+                elif rep.get("type") == 8:
+                    dev["allow_audio_auto_switch"] = rep["allow_audio_auto_switch"]
+                elif rep.get("type") == 9:
+                    dev["lock_channel"] = rep["lock_channel"]
+        result = list(devices.values())
+        result.sort(key=lambda d: d.get("index", 255))
+        log.debug(f"Bonded devices: {len(result)}")
+        for d in result:
+            log.debug(
+                f"  [{d.get('index')}] {d.get('name', '?')} {d.get('addr')} "
+                f"state={d.get('conn_state')} primary={d.get('primary')}"
+            )
+        return result
+
+    def _resolve_bonded_mac(self, target: str, timeout: float = 2.0) -> Optional[str]:
+        mac = target.strip().upper().replace("-", ":")
+        if re.match(r"^([0-9A-F]{2}:){5}[0-9A-F]{2}$", mac):
+            return mac
+        try:
+            index = int(target)
+        except ValueError:
+            log.warning(f"Device target must be a MAC or index, got '{target}'")
+            return None
+        for d in self.get_bonded_devices(timeout):
+            if d.get("index") == index:
+                return d["addr"]
+        log.warning(f"No bonded device with index {index}")
+        return None
+
+    def _parse_type_operate_result(self, data: bytes) -> Optional[dict]:
+        result = {}
+        for tlv in parse_tlv(data):
+            if tlv["tag"] == 30 and len(tlv["value"]) == 1:
+                result["type"] = tlv["value"][0]
+            elif tlv["tag"] == 31 and len(tlv["value"]) == 1:
+                result["result"] = tlv["value"][0]
+        if result:
+            return result
+        status = self._parse_status_code(data)
+        if status is not None:
+            return {"type": None, "result": status}
+        return None
+
+    def _send_single_device_setting(self, sub: int, mac: str) -> Optional[dict]:
+        mac_bytes = mac_to_bytes(mac)
+        if len(mac_bytes) != 6:
+            log.warning(f"Invalid MAC: {mac}")
+            return None
+        frames = self.send_command(Cmd.single_device_setting(sub, mac_bytes))
+        for f in frames:
+            if f["svc"] == 0x2B and f["cmd"] == 0x33:
+                res = self._parse_type_operate_result(f["data"])
+                if res:
+                    return {"mac": mac, "sub": sub, **res}
+        if frames:
+            return {"mac": mac, "sub": sub, "type": None, "result": None}
+        return None
+
+    def connect_device(self, mac: str) -> Optional[dict]:
+        return self._send_single_device_setting(1, mac)
+
+    def disconnect_device(self, mac: str) -> Optional[dict]:
+        return self._send_single_device_setting(2, mac)
+
+    def unpair_device(self, mac: str) -> Optional[dict]:
+        return self._send_single_device_setting(3, mac)
+
+    def set_primary_device(self, mac: str) -> Optional[dict]:
+        mac_bytes = mac_to_bytes(mac)
+        if len(mac_bytes) != 6:
+            log.warning(f"Invalid MAC: {mac}")
+            return None
+        frames = self.send_command(Cmd.set_primary_device(mac_bytes))
+        if not frames:
+            return None
+        f = self._match_frame(frames, 0x2B, 0x32)
+        if f:
+            return {"mac": mac, "success": True, "raw": f["data"].hex()}
+        return {"mac": mac, "success": None, "raw": frames[0]["data"].hex()}
+
     def _find_anc_mode(self, data: bytes) -> Optional[int]:
         if self._is_status_response(data):
             return None
@@ -2207,15 +2402,27 @@ def cmd_scan(args):
 def print_run_help():
     # fmt: off
     print("Available commands:")
-    print("  bat                           - Get battery levels")
-    print("  ver                           - Get firmware/device version")
-    print("  info                          - Fetch all settings at once")
-    print("  gesture <type> [<side> <act>] - Get/set gesture (lp|pinch|slide|dc|triple|lhold|nc)")
-    print("  anc [<mode>|level <name|0-3>] - Get/set noise control (off|on|aware; level: general|cozy|ultra|dynamic)")
-    print("  sfx [<name>]                  - Get/set sound effect (default|bass|treble|voices)")
-    print("  lang [<code>]                 - Get/set language")
-    print("  misc [<name> [on|off]]        - Get/set misc features")
-    print("  raw <hex>                     - Send raw command bytes")
+    print("  bat                            - Get battery levels")
+    print("  ver                            - Get firmware/device version")
+    print("  info                           - Fetch all settings at once")
+    print("  gesture <type> [<side> <act>]  - Get/set gesture (lp|pinch|slide|dc|triple|lhold|nc)")
+    print("  anc [<mode>|level <name|0-3>]  - Get/set noise control (off|on|aware; level: general|cozy|ultra|dynamic)")
+    print("  sfx [<name>]                   - Get/set sound effect (default|bass|treble|voices)")
+    print("  lang [<code>]                  - Get/set language")
+    print("  misc [<name> [on|off]]         - Get/set misc features")
+    print("  devices [<action> [<mac|idx>]] - List/connect/disconnect/unpair devices stored on the buds")
+    print("  raw <hex>                      - Send raw command bytes")
+    # fmt: on
+
+
+def print_devices_help():
+    # fmt: off
+    print("Paired device management (list stored on the buds):")
+    print("  devices                       - List all devices")
+    print("  devices connect <mac|idx>     - Connect the buds to a device")
+    print("  devices disconnect <mac|idx>  - Disconnect from a device")
+    print("  devices unpair <mac|idx>      - Forget a device on the buds")
+    print("  devices primary <mac|idx>     - Set the default/primary device")
     # fmt: on
 
 
@@ -2632,6 +2839,70 @@ def cmd_run(args):
                         print(f"{FEATURES[fname]['name']}: {', '.join(items)}")
                     else:
                         print("no response")
+
+            elif cmd_name in ("devices", "dev"):
+                action = parts[1].lower() if len(parts) >= 2 else "list"
+                if action in ("help", "-h"):
+                    print_devices_help()
+                elif (
+                    action == "list"
+                    and i < len(args.commands)
+                    and args.commands[i].strip().lower() == "help"
+                ):
+                    i += 1
+                    print_devices_help()
+                elif action == "list":
+                    devs = ctrl.get_bonded_devices()
+                    if not devs:
+                        print("No paired devices reported")
+                    for d in devs:
+                        state = "Connected" if d.get("conn_state") else "Idle"
+                        prim = " Primary" if d.get("primary") else ""
+                        print(
+                            f"[{d.get('index')}] {d.get('name', '?')} "
+                            f"{d.get('addr', '?')} - {state}{prim}"
+                        )
+                elif len(parts) >= 3:
+                    if action not in ("connect", "disconnect", "unpair", "primary"):
+                        print(f"Unknown devices action '{parts[1]}'. Use: devices help")
+                    else:
+                        mac = ctrl._resolve_bonded_mac(parts[2])
+                        if not mac:
+                            print(f"Unknown device '{parts[2]}'")
+                        elif action == "connect":
+                            r = ctrl.connect_device(mac)
+                            if r and r.get("result") in (0, 100000):
+                                print(f"Connected {mac}")
+                            elif r:
+                                print(f"Connect failed: result={r.get('result')}")
+                            else:
+                                print("no response")
+                        elif action == "disconnect":
+                            r = ctrl.disconnect_device(mac)
+                            if r and r.get("result") in (0, 100000):
+                                print(f"Disconnected {mac}")
+                            elif r:
+                                print(f"Disconnect failed: result={r.get('result')}")
+                            else:
+                                print("no response")
+                        elif action == "unpair":
+                            r = ctrl.unpair_device(mac)
+                            if r and r.get("result") in (0, 100000):
+                                print(f"Unpaired {mac}")
+                            elif r:
+                                print(f"Unpair failed: result={r.get('result')}")
+                            else:
+                                print("no response")
+                        elif action == "primary":
+                            r = ctrl.set_primary_device(mac)
+                            if r and r.get("success"):
+                                print(f"Primary device: {mac}")
+                            elif r:
+                                print(f"Set primary failed: raw={r.get('raw', '?')}")
+                            else:
+                                print("no response")
+                else:
+                    print(f"Usage: devices {action} <mac|idx>")
 
             elif cmd_name == "lang":
                 if len(parts) >= 2:
