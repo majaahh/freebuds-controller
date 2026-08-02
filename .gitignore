@@ -3,9 +3,19 @@
 
 .mac
 *.apk
+*.hprof
+*.iml
 *.json
 *.md
 *pycache*
+android/.gradle/
+android/.kotlin/
+android/build/
+android/app/build/
+android/local.properties
+android/captures/
+android/.cxx/
+android/.idea/
 
 # Skip ignore
 !README.md
