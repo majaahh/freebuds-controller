@@ -5,7 +5,9 @@
 *.apk
 *.json
 *.md
+*.o
 *pycache*
+freebuds
 
 # Skip ignore
 !README.md
