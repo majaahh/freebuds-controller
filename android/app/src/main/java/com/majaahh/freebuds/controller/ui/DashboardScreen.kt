@@ -74,7 +74,51 @@ fun DashboardScreen(vm: MainViewModel) {
             item { SfxCard(vm) }
         }
 
-        val gestureList = vm.meta?.gestures?.values?.toList() ?: emptyList()
+        if (vm.locator.isNotEmpty()) {
+            item {
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(20.dp)) {
+                        Text("Find my earphones", style = MaterialTheme.typography.titleMedium)
+                        Text("Remove the earbud before playing the locator sound.")
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            vm.locator.forEach { (side, ringing) ->
+                                OutlinedButton(onClick = { vm.setLocator(side, !ringing) }) {
+                                    Text("${if (ringing) "Stop" else "Ring"} $side")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (vm.languages.isNotEmpty()) {
+            item {
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(20.dp)) {
+                        Text("Voice prompt language", style = MaterialTheme.typography.titleMedium)
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            vm.languages.forEach { code ->
+                                OutlinedButton(onClick = { vm.setLanguage(code) }) { Text(code) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (vm.paired.isNotEmpty()) {
+            item {
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("Paired devices", style = MaterialTheme.typography.titleMedium)
+                        vm.paired.forEach { Text(it) }
+                    }
+                }
+            }
+        }
+
+        val gestureList = vm.meta?.gestures?.values?.filter { vm.gestures[it.key]?.supported?.isNotEmpty() == true } ?: emptyList()
         if (gestureList.isNotEmpty()) {
             item {
                 GesturesCard(
@@ -85,7 +129,7 @@ fun DashboardScreen(vm: MainViewModel) {
             }
         }
 
-        val features = vm.meta?.features?.values?.filter { it.settable } ?: emptyList()
+        val features = vm.meta?.features?.values?.filter { it.settable && vm.features[it.key]?.enabled != null } ?: emptyList()
         if (features.isNotEmpty()) {
             item {
                 FeaturesCard(
@@ -272,7 +316,8 @@ private fun GestureRow(
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text(g.name, style = MaterialTheme.typography.titleSmall)
 
-        if (g.actions.isEmpty()) {
+        val actions = g.actions.filterKeys { it in state.supported }
+        if (actions.isEmpty()) {
             Text(
                 "No configurable actions reported by the device.",
                 style = MaterialTheme.typography.bodySmall,
@@ -283,14 +328,14 @@ private fun GestureRow(
 
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             ActionDropdown(
-                label = "Left",
-                actions = g.actions,
+                label = if (state.right == null) g.name else "Left",
+                actions = actions,
                 selected = state.left,
                 modifier = Modifier.weight(1f),
             ) { onSet(1, it) }
-            ActionDropdown(
+            if (state.right != null) ActionDropdown(
                 label = "Right",
-                actions = g.actions,
+                actions = actions,
                 selected = state.right,
                 modifier = Modifier.weight(1f),
             ) { onSet(2, it) }

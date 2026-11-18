@@ -44,6 +44,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     var anc by mutableStateOf<AncState?>(null)
     var gestures by mutableStateOf<Map<String, GestureState>>(emptyMap())
     var features by mutableStateOf<Map<String, FeatureState>>(emptyMap())
+    var languages by mutableStateOf<List<String>>(emptyList())
+    var locator by mutableStateOf<Map<String, Boolean>>(emptyMap())
+    var paired by mutableStateOf<List<String>>(emptyList())
     var sfx by mutableStateOf<SfxState?>(null)
 
     var message by mutableStateOf<String?>(null)
@@ -72,7 +75,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     prefs.edit().putString("mac", mac).apply()
                     connected = true
                     showMessage("Connected to ${mac.trim()}")
-                    loadMeta()
+                    meta = Parsers.meta(Api.get("/api/meta"))
                     refresh()
                 } else {
                     showMessage(resp.optString("error", "Connect failed"))
@@ -96,18 +99,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             anc = null
             gestures = emptyMap()
             features = emptyMap()
+            languages = emptyList()
+            paired = emptyList()
+            locator = emptyMap()
             sfx = null
             deviceInfo = null
-        }
-    }
-
-    fun loadMeta() {
-        viewModelScope.launch {
-            try {
-                meta = Parsers.meta(Api.get("/api/meta"))
-            } catch (e: Exception) {
-                showMessage("Could not load device metadata: ${e.message}")
-            }
         }
     }
 
@@ -121,6 +117,24 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 deviceInfo = Parsers.version(info.optJSONObject("version"))
                 gestures = gesturesOf(info, meta)
                 features = featuresOf(info)
+                languages = info.optJSONObject("language")?.optJSONArray("supported")?.let { list ->
+                    (0 until list.length()).map { list.getString(it) }
+                }.orEmpty()
+                locator = buildMap {
+                    for (side in listOf("left", "right")) {
+                        info.optJSONObject("locator")?.optJSONObject(side)?.let {
+                            put(side, it.getBoolean("ringing"))
+                        }
+                    }
+                }
+                paired = info.optJSONArray("devices")?.let { list ->
+                    (0 until list.length()).map { index ->
+                        val device = list.getJSONObject(index)
+                        val state = if (device.optInt("conn_state") == 1) "Connected" else "Idle"
+                        val primary = if (device.optInt("primary") == 1) " · Primary" else ""
+                        "${device.optString("name").ifBlank { device.optString("addr") }} · $state$primary"
+                    }
+                }.orEmpty()
                 sfx = Parsers.sfx(info.optJSONObject("sound_effect"))
             } catch (e: Exception) {
                 showMessage("Refresh failed: ${e.message}")
@@ -213,6 +227,28 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 sfx = SfxState(mode, m?.eqModes?.get(mode))
             } catch (e: Exception) {
                 showMessage("Sound effect failed: ${e.message}")
+            }
+        }
+    }
+
+    fun setLocator(side: String, ring: Boolean) {
+        viewModelScope.launch {
+            try {
+                val result = Api.post("/api/locator", JSONObject().put("side", side).put("ring", ring))
+                locator = locator + (side to result.getJSONObject("locator").getBoolean("ringing"))
+            } catch (e: Exception) {
+                showMessage("Earbud locator failed: ${e.message}")
+            }
+        }
+    }
+
+    fun setLanguage(code: String) {
+        viewModelScope.launch {
+            try {
+                Api.post("/api/language", JSONObject().put("code", code))
+                showMessage("Language set to $code")
+            } catch (e: Exception) {
+                showMessage("Language update failed: ${e.message}")
             }
         }
     }

@@ -105,7 +105,7 @@ object Parsers {
         left = if (o?.has("left") == true) o.optInt("left") else null,
         right = if (o?.has("right") == true) o.optInt("right") else null,
         supported = o?.optJSONArray("supported")?.let { arr ->
-            (0 until arr.length()).mapNotNull { i -> arr.optInt(i).takeIf { it != 255 } }
+            (0 until arr.length()).map { i -> arr.getInt(i) }
         } ?: emptyList(),
     )
 

@@ -8,7 +8,15 @@ import socket
 import subprocess
 import logging
 import re
-from threading import Lock
+import hashlib
+import io
+import shutil
+import tempfile
+import time
+import urllib.request
+import zipfile
+from pathlib import Path
+from threading import RLock
 from typing import Optional
 
 logging.basicConfig(
@@ -67,7 +75,7 @@ def crc16(data: bytes) -> int:
 
 class Cmd:
     BATTERY = bytes([0x01, 0x08, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00])
-    VERSION = bytes([0x01, 0x07] + sum([[i, 0x00] for i in range(1, 13)], []))
+    VERSION = bytes([0x01, 0x07] + sum([[i, 0x00] for i in (*range(1, 13), 15)], []))
     CMD_01_1D = bytes([0x01, 0x1D, 0x01, 0x01, 0x01])
 
     GET_SERVICE_ABILITY = bytes([0x01, 0x02, 0x01, 0x00])
@@ -150,11 +158,12 @@ class Cmd:
         return bytes([0x2B, 0x08, 0x01, 0x01, level & 0xFF])
 
     @staticmethod
-    def set_noise_control(mode: int, value: int = None) -> bytes:
-        payload = bytes([0x2B, 0x18, 0x01, 0x01, mode & 0xFF])
-        if value is not None:
-            payload += bytes([0x02, 0x01, value & 0xFF])
-        return payload
+    def set_noise_control(left: Optional[int], right: Optional[int] = None) -> bytes:
+        payload = bytearray((0x2B, 0x18))
+        for tag, value in ((1, left), (2, right)):
+            if value is not None:
+                payload.extend((tag, 1, value))
+        return bytes(payload)
 
     GET_EQ = bytes([0x2B, 0x4A, 0x02, 0x00])
 
@@ -270,12 +279,12 @@ class Cmd:
     def set_32k_hd(enable: bool) -> bytes:
         return bytes([0x2B, 0x45, 0x01, 0x01, 0x01 if enable else 0x00])
 
-    GET_HD_SWITCH = bytes([0x2B, 0x5E, 0x01, 0x01, 0x01])
+    GET_HD_SWITCH = bytes([0x2B, 0xA3, 0x01, 0x01])
 
     @staticmethod
     def set_hd_switch(enable: bool) -> bytes:
         v = 0x01 if enable else 0x00
-        return bytes([0x2B, 0x5D, 0x01, 0x02, v, v])
+        return bytes([0x2B, 0xA2, 0x01, 0x01, v])
 
     GET_LEFT_RIGHT_EAR = bytes([0x2B, 0x9A, 0x01, 0x00])
 
@@ -359,49 +368,22 @@ DC_ACTIONS = {
     0: "Voice assistant",
     1: "Play/Pause",
     2: "Next track",
-    3: "Noise cancelling on/off",
-    4: "Play/Next",
-    5: "Noise cancelling on/off/ambient",
-    6: "Noise cancelling on/ambient",
     7: "Previous track",
-    8: "Play/Previous",
-    9: "Noise cancelling off/ambient",
     255: "None",
 }
 
 LP_ACTIONS = {
-    0: "Voice assistant",
-    1: "Play/Pause",
-    2: "Next track",
-    3: "Noise cancelling on/off",
-    4: "Play/Next",
-    5: "Noise cancelling on/off/ambient",
-    6: "Noise cancelling on/ambient",
-    7: "Previous track",
-    8: "Play/Previous",
-    9: "Noise cancelling off/ambient",
     10: "Noise control",
-    11: "Reject call",
     14: "Song recognition",
     15: "Freestyle listen",
-    17: "Health query",
     255: "None",
 }
 
-TRIPLE_ACTIONS = {
-    0: "Voice assistant",
-    1: "Play/Pause",
-    2: "Next track",
-    3: "Noise cancelling on/off",
-    4: "Noise control",
-    7: "Previous track",
-    255: "None",
-}
-
-SLIDE_ACTIONS = {
-    0: "Volume",
-    1: "Prev/Next track",
-    255: "None",
+TRIPLE_ACTIONS = {2: "Next track", 7: "Previous track", 255: "None"}
+SLIDE_ACTIONS = {0: "Volume", 255: "None"}
+CALL_ACTIONS = {
+    "long_press": {0: "Reject call", 255: "None"},
+    "double_click": {0: "Answer/End call", 255: "None"},
 }
 
 PINCH_ACTIONS = {
@@ -416,8 +398,18 @@ PINCH_ACTIONS = {
 
 ACTION_NOISE_CONTROL = {
     "long_press": 10,
-    "double_click": 5,
-    "triple_click": 4,
+}
+
+NOISE_CYCLES = {
+    1: "Noise cancelling / Off",
+    2: "Noise cancelling / Off / Awareness",
+    3: "Noise cancelling / Awareness",
+    4: "Off / Awareness",
+}
+
+CALL_SETTERS = {
+    "double_click": Cmd.set_double_click_call,
+    "long_press": Cmd.set_long_press_call,
 }
 
 ACTION_RESULT = {
@@ -527,9 +519,9 @@ def resolve_eq_mode(value) -> Optional[int]:
 
 
 _CMD_NAMES = {
-    "help", "bat", "ver", "info",
-    "gesture", "anc", "nc", "sfx", "lang", "raw", "misc",
-    "lp", "sp", "slide", "dc", "triple", "pinch", "lhold", "devices", "dev",
+    "help", "bat", "ver", "info", "find",
+    "fit", "gesture", "cycle", "anc", "nc", "sfx", "lang", "raw", "misc",
+    "devices", "dev",
 }  # fmt: skip
 
 GESTURE_TYPES = {
@@ -542,16 +534,6 @@ GESTURE_TYPES = {
         "cmd": 0x17,
         "set_cmd": 0x16,
         "actions": LP_ACTIONS,
-    },
-    "pinch": {
-        "name": "Pinch",
-        "aliases": ("pinch", "sp"),
-        "get": Cmd.GET_PINCH,
-        "set": Cmd.set_pinch,
-        "svc": 0x2B,
-        "cmd": 0x21,
-        "set_cmd": 0x20,
-        "actions": PINCH_ACTIONS,
     },
     "slide": {
         "name": "Slide",
@@ -583,16 +565,6 @@ GESTURE_TYPES = {
         "set_cmd": 0x25,
         "actions": TRIPLE_ACTIONS,
     },
-    "light_hold": {
-        "name": "Light hold",
-        "aliases": ("lhold", "lh"),
-        "get": Cmd.GET_LIGHT_HOLD,
-        "set": Cmd.set_light_hold,
-        "svc": 0x2B,
-        "cmd": 0x93,
-        "set_cmd": 0x92,
-        "actions": LP_ACTIONS,
-    },
 }
 
 GESTURE_ALIASES = {}
@@ -601,26 +573,13 @@ for _gkey, _gtype in GESTURE_TYPES.items():
     for _alias in _gtype["aliases"]:
         GESTURE_ALIASES[_alias] = _gkey
 
+_CMD_NAMES.update(GESTURE_ALIASES)
+
 FEATURES = {
-    "greet": {
-        "name": "Voice prompts",
-        "get": "get_greet_setting",
-        "set": "set_greet",
-    },
     "wear": {
         "name": "Wear detection",
         "get": "get_wear_setting",
         "set": "set_wear",
-    },
-    "ivol": {
-        "name": "Intellect volume",
-        "get": "get_intellect_volume",
-        "set": "set_intellect_volume",
-    },
-    "save": {
-        "name": "Saving mode",
-        "get": "get_saving_mode",
-        "set": "set_saving_mode",
     },
     "glat": {
         "name": "Game low latency",
@@ -632,30 +591,15 @@ FEATURES = {
         "get": "get_dual_connect",
         "set": "set_dual_connect",
     },
-    "trans": {
-        "name": "Translate mode",
-        "get": "get_translate_mode",
-        "set": "set_translate_mode",
-    },
     "venh": {
         "name": "Voice enhance",
         "get": "get_voice_enhance",
         "set": "set_voice_enhance",
     },
-    "32k": {
-        "name": "32K HD voice",
-        "get": "get_32k_hd",
-        "set": "set_32k_hd",
-    },
     "hd": {
-        "name": "HD sound switch",
+        "name": "Prioritize sound quality",
         "get": "get_hd_switch",
         "set": "set_hd_switch",
-    },
-    "lre": {
-        "name": "L/R ear recognition",
-        "get": "get_left_right_ear",
-        "set": "set_left_right_ear",
     },
     "wind": {
         "name": "Wind mode",
@@ -672,14 +616,9 @@ FEATURES = {
         "get": "get_health_alerts",
         "set": "set_health_alerts",
     },
+    "dynamic": {"name": "Dynamic ANC capability", "get": "get_dynamic_anc_support"},
     "wearst": {"name": "Wearing status", "get": "get_wearing_status"},
-    "dormant": {"name": "Dormant time", "get": "get_dormant_time"},
-    "pair": {"name": "Pair state", "get": "get_pair_state"},
-    "fit": {"name": "Earplug fit check", "get": "get_fit_check"},
-    "fitver": {"name": "Fit-detect version", "get": "get_fit_detect_version"},
-    "hb": {"name": "Heartbeat", "get": "get_heartbeat"},
     "btmain": {"name": "BT main status", "get": "get_bt_main_status"},
-    "cover": {"name": "Close-cover remind", "get": "get_close_cover_remind"},
     "music": {"name": "Music mode", "get": "get_music_mode"},
     "ambient": {"name": "Ambient sound", "get": "get_ambient_sound"},
     "conn": {"name": "Connect ability", "get": "get_connect_ability"},
@@ -763,12 +702,38 @@ def mac_to_str(raw: bytes) -> str:
     return ":".join(f"{b:02X}" for b in raw)
 
 
+FIT_RESOURCE_URL = (
+    "https://contentcenter-dre.dbankcdn.cn/pub_1/HW-SmartHome_oem_900_9/"
+    "b0/v3/eu/device/guide/000145/000145_01.zip"
+)
+FIT_AUDIO_HASH = "dcdb02ba6eb810f19cb6a298fd53c3fa7e22a47076aea86a062ce3c8bbbf9ed3"
+
+
+def fit_audio() -> Path:
+    destination = Path.home() / ".cache" / "freebuds-controller" / "detect_music.ogg"
+    if (
+        destination.is_file()
+        and hashlib.sha256(destination.read_bytes()).hexdigest() == FIT_AUDIO_HASH
+    ):
+        return destination
+    with urllib.request.urlopen(FIT_RESOURCE_URL, timeout=30) as response:
+        with zipfile.ZipFile(io.BytesIO(response.read())) as archive:
+            audio = archive.read("000145_01/detect_music.ogg")
+    if hashlib.sha256(audio).hexdigest() != FIT_AUDIO_HASH:
+        raise ValueError("Unexpected Huawei fit-test audio checksum")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as stream:
+        stream.write(audio)
+    Path(stream.name).replace(destination)
+    return destination
+
+
 class FreeBudsController:
     def __init__(self, mac_address: str = None):
         self.mac_address = mac_address
         self.sock = None
         self._connected = False
-        self._lock = Lock()
+        self._lock = RLock()
 
     def connect(self, mac_address: str = None, channel: int = SPP_CHANNEL) -> bool:
         if mac_address:
@@ -830,7 +795,7 @@ class FreeBudsController:
                     except socket.timeout:
                         break
 
-                return parse_frames(response)
+                return [f for f in parse_frames(response) if f["crc_ok"]]
 
             except Exception as e:
                 log.error(f"Send error: {e}")
@@ -876,6 +841,13 @@ class FreeBudsController:
                 "right_battery": val[1],
                 "box_battery": val[2],
             }
+            charging = self._extract_tlv_value(f["data"], 3) or b""
+            for side, state in zip(("left", "right", "box"), charging):
+                bat[side + "_charging"] = bool(state)
+            in_box = self._extract_tlv_value(f["data"], 5) or b""
+            for side, state in zip(("left", "right"), in_box):
+                if state in (0, 1):
+                    bat[side + "_in_box"] = bool(state)
             log.debug(
                 f"Battery: L={bat['left_battery']}% "
                 f"R={bat['right_battery']}% Box={bat['box_battery']}%"
@@ -909,6 +881,8 @@ class FreeBudsController:
                 if val and len(val) < 100:
                     key = known.get(tag, f"field_{tag}")
                     result[key] = val
+                    if tag == 15:
+                        result["ota_package"] = val
                     if key == "firmware":
                         log.debug(f"Firmware: {val}")
             except Exception:
@@ -1043,18 +1017,16 @@ class FreeBudsController:
                 result["right_name"] = actions.get(v[0], f"Unknown ({v[0]})")
                 found = True
             elif tlv["tag"] == 3:
-                result["supported"] = [b for b in v if b != 0xFF]
+                result["supported"] = list(v)
                 result["supported_names"] = [
                     actions.get(b, f"Unknown ({b})") for b in result["supported"]
                 ]
                 found = True
             elif tlv["tag"] == 4 and len(v) == 1:
-                result["call_left"] = v[0]
-                result["call_left_name"] = actions.get(v[0], f"Unknown ({v[0]})")
+                result["call_action"] = v[0]
                 found = True
-            elif tlv["tag"] == 5 and len(v) == 1:
-                result["call_right"] = v[0]
-                result["call_right_name"] = actions.get(v[0], f"Unknown ({v[0]})")
+            elif tlv["tag"] == 6:
+                result["call_supported"] = list(v)
                 found = True
 
         if found:
@@ -1077,14 +1049,12 @@ class FreeBudsController:
 
         frames = self.send_command(cmd_payload)
         f = self._match_frame(frames, svc, cmd)
-        if not f and frames:
-            f = frames[0]
         if not f:
             log.warning(f"No {name} set response")
             return None
 
         data = f["data"]
-        side_name = "Left" if side == SIDE_LEFT else "Right"
+        side_name = {0: "Both", 1: "Left", 2: "Right"}[side]
         action_name = actions.get(action, f"Unknown ({action})")
         result = {
             "side": side,
@@ -1105,9 +1075,16 @@ class FreeBudsController:
             return result
 
         for tlv in parse_tlv(data):
-            if tlv["tag"] in (3, 6) and len(tlv["value"]) == 1:
+            if (
+                tlv["tag"] == (6 if cmd_payload[2] == 4 else 3)
+                and len(tlv["value"]) == 1
+            ):
                 code = tlv["value"][0]
-                ok = code in (0, 2)
+                ok = (
+                    code in (0, 2)
+                    if side == 0
+                    else code == (2 if side == SIDE_RIGHT else 0)
+                )
                 result["success"] = ok
                 result["result"] = code
                 result["result_name"] = ACTION_RESULT.get(code, f"Unknown ({code})")
@@ -1120,8 +1097,9 @@ class FreeBudsController:
                     log.warning(f"{name}: set failed ({ACTION_RESULT.get(code, code)})")
                 return result
 
-        resp_action = self._extract_byte_at(data, 2)
-        if resp_action is not None:
+        echo = self._extract_tlv_value(data, cmd_payload[2])
+        if echo and len(echo) == 1:
+            resp_action = echo[0]
             result["success"] = resp_action == action
             if result["success"]:
                 log.debug(f"{name}: {side_name} -> {action_name}")
@@ -1155,27 +1133,72 @@ class FreeBudsController:
                 log.warning(f"{name}: set failed (status=0x{status:08X})")
             return result
 
-        success = True
-        result = {"enabled": enable, "success": success}
-        log.info(f"{name}: set to {'On' if enable else 'Off'}")
-        return result
+        return {"enabled": enable, "success": None, "raw": data.hex()}
 
     def _get_touch_gesture(self, key: str) -> Optional[dict]:
         gtype = GESTURE_TYPES[key]
-        return self._parse_touch_get(
-            self.send_command(gtype["get"]),
+        state = self._parse_touch_get(
+            self.send_command(gtype["get"] + b"\x03\x00"),
             gtype["svc"],
             gtype["cmd"],
             gtype["name"],
             gtype["actions"],
         )
 
+        if state and "supported" in state:
+            advertised = state["supported"]
+            state["advertised"] = advertised
+            state["supported"] = [
+                v
+                for v in gtype["actions"]
+                if v in advertised or (key == "long_press" and v == 255)
+            ]
+            state["supported_names"] = [gtype["actions"][v] for v in state["supported"]]
+        if state and key in CALL_ACTIONS and "call_action" in state:
+            state["call_name"] = CALL_ACTIONS[key].get(state["call_action"], "Unknown")
+        if key == "slide" and state and "left" in state:
+            state["global"] = state.pop("left")
+            state["global_name"] = state.pop("left_name")
+            state.pop("right", None)
+            state.pop("right_name", None)
+        return state
+
+    def set_call_gesture(self, gesture: str, action: int) -> Optional[dict]:
+        key = GESTURE_ALIASES.get(gesture.lower())
+        if key not in CALL_SETTERS:
+            return None
+        state = self._get_touch_gesture(key)
+        if (
+            not state
+            or action not in CALL_ACTIONS[key]
+            or action not in state.get("call_supported", ())
+        ):
+            return None
+        entry = GESTURE_TYPES[key]
+        result = self._send_touch_set(
+            CALL_SETTERS[key](action),
+            entry["svc"],
+            entry["set_cmd"],
+            entry["name"],
+            0,
+            action,
+            CALL_ACTIONS[key],
+        )
+
+        if result and result.get("success") is not False:
+            observed = self._get_touch_gesture(key) or {}
+            result["success"] = observed.get("call_action") == action
+        return result
+
     def _set_touch_gesture(self, key: str, side: int, action: int) -> Optional[dict]:
         gtype = GESTURE_TYPES[key]
-        left = action if side == SIDE_LEFT else None
+        left = action if side in (0, SIDE_LEFT) else None
         right = action if side == SIDE_RIGHT else None
-        payload = gtype["set"](left, right)
-        return self._send_touch_set(
+        if key == "slide" and side == 0:
+            payload = bytes([0x2B, 0x1E, 1, 1, action, 2, 2, action])
+        else:
+            payload = gtype["set"](left, right)
+        result = self._send_touch_set(
             payload,
             gtype["svc"],
             gtype["set_cmd"],
@@ -1184,6 +1207,12 @@ class FreeBudsController:
             action,
             gtype["actions"],
         )
+
+        if result and result.get("success") is not False:
+            observed = self._get_touch_gesture(key) or {}
+            field = {0: "global", 1: "left", 2: "right"}[side]
+            result["success"] = observed.get(field) == action
+        return result
 
     def get_gesture_action(self, gesture_type: str) -> Optional[dict]:
         key = GESTURE_ALIASES.get(gesture_type.lower())
@@ -1204,54 +1233,43 @@ class FreeBudsController:
             )
             return None
         gtype = GESTURE_TYPES[key]
-        if action not in gtype["actions"] and action != 255:
-            log.warning(
-                f"Action {action} not in {gtype['name']} table: "
-                f"{list(gtype['actions'])}"
+        state = self._get_touch_gesture(key)
+        if not state or action not in state.get("supported", ()):
+            log.error(
+                f"{gtype['name']}: action {action} is unavailable for FreeBuds 5i"
             )
+            return None
+        if "global" in state:
+            if side not in (0, SIDE_LEFT):
+                return None
+            side = 0
+        elif {1: "left", 2: "right"}.get(side) not in state:
+            return None
         return self._set_touch_gesture(key, side, action)
 
     def get_long_press_action(self) -> Optional[dict]:
         return self._get_touch_gesture("long_press")
 
     def set_long_press_action(self, side: int, action: int) -> Optional[dict]:
-        return self._set_touch_gesture("long_press", side, action)
-
-    def get_short_press_action(self) -> Optional[dict]:
-        return self._get_touch_gesture("pinch")
-
-    def set_short_press_action(self, side: int, action: int) -> Optional[dict]:
-        return self._set_touch_gesture("pinch", side, action)
-
-    def get_pinch_action(self) -> Optional[dict]:
-        return self._get_touch_gesture("pinch")
-
-    def set_pinch_action(self, side: int, action: int) -> Optional[dict]:
-        return self._set_touch_gesture("pinch", side, action)
+        return self.set_gesture_action("long_press", side, action)
 
     def get_triple_click_action(self) -> Optional[dict]:
         return self._get_touch_gesture("triple_click")
 
     def set_triple_click_action(self, side: int, action: int) -> Optional[dict]:
-        return self._set_touch_gesture("triple_click", side, action)
-
-    def get_light_hold_action(self) -> Optional[dict]:
-        return self._get_touch_gesture("light_hold")
-
-    def set_light_hold_action(self, side: int, action: int) -> Optional[dict]:
-        return self._set_touch_gesture("light_hold", side, action)
+        return self.set_gesture_action("triple_click", side, action)
 
     def get_slide_action(self) -> Optional[dict]:
         return self._get_touch_gesture("slide")
 
     def set_slide_action(self, side: int, action: int) -> Optional[dict]:
-        return self._set_touch_gesture("slide", side, action)
+        return self.set_gesture_action("slide", side, action)
 
     def get_double_click_action(self) -> Optional[dict]:
         return self._get_touch_gesture("double_click")
 
     def set_double_click_action(self, side: int, action: int) -> Optional[dict]:
-        return self._set_touch_gesture("double_click", side, action)
+        return self.set_gesture_action("double_click", side, action)
 
     def set_noise_control_gesture(self, gesture_type: str, side: int) -> Optional[dict]:
         key = GESTURE_ALIASES.get(gesture_type.lower())
@@ -1264,7 +1282,7 @@ class FreeBudsController:
         if nc_action is None:
             log.error(f"{GESTURE_TYPES[key]['name']} has no noise-control action")
             return None
-        return self._set_touch_gesture(key, side, nc_action)
+        return self.set_gesture_action(key, side, nc_action)
 
     def get_noise_control_status(self) -> dict:
         result = {"noise_control_assigned": [], "details": {}}
@@ -1308,7 +1326,10 @@ class FreeBudsController:
         if not setter:
             log.error(f"{entry['name']} is read-only")
             return None
-        return getattr(self, setter)(enable)
+        result = getattr(self, setter)(enable)
+        if result and result.get("success") is None:
+            result["success"] = (self.get_feature(feat) or {}).get("enabled") is enable
+        return result
 
     def start_pair(self) -> Optional[dict]:
         frames = self.send_command(Cmd.STATE_PAIR)
@@ -1422,14 +1443,36 @@ class FreeBudsController:
         )
 
     def get_hd_switch(self) -> Optional[dict]:
-        return self._parse_bool_get(
-            self.send_command(Cmd.GET_HD_SWITCH), 0x2B, 0x5E, 0x5D, "HD sound switch"
-        )
+        frame = self._match_frame(self.send_command(Cmd.GET_HD_SWITCH), 0x2B, 0xA3)
+        if frame:
+            value = self._extract_tlv_value(frame["data"], 2)
+            if value in (b"\x00", b"\x01"):
+                return {"enabled": value == b"\x01"}
+        return None
 
     def set_hd_switch(self, enable: bool) -> Optional[dict]:
         return self._send_bool_setter(
-            Cmd.set_hd_switch(enable), 0x2B, 0x5D, "HD sound switch", enable
+            Cmd.set_hd_switch(enable), 0x2B, 0xA2, "Prioritize sound quality", enable
         )
+
+    def locator(self, side, ring=None):
+        if side not in ("left", "right"):
+            raise ValueError("Choose left or right")
+        index = int(side == "right")
+        if ring is not None:
+            if ring and (self.get_wearing_status() or {}).get(side + "_ear") != 0:
+                return {"success": False, "error": "Remove the earbud before ringing it"}
+            cmd = bytes((0x2B, 0x5D, 1, 2, index, int(not ring)))
+            frame = self._match_frame(self.send_command(cmd), 0x2B, 0x5D)
+            if frame and self._parse_status_code(frame["data"]) not in (None, 100000):
+                return {"success": False, "status": self._parse_status_code(frame["data"])}
+        cmd = bytes((0x2B, 0x5E, 1, 1, index))
+        frame = self._match_frame(self.send_command(cmd), 0x2B, 0x5E)
+        value = self._extract_tlv_value(frame["data"], 2) if frame else None
+        if value is None or len(value) != 2 or value[0] != index or value[1] not in (0, 1):
+            return None
+        ringing = value[1] == 0
+        return {"ringing": ringing, "success": ring is None or ringing == ring}
 
     def get_left_right_ear(self) -> Optional[dict]:
         return self._parse_bool_get(
@@ -1535,6 +1578,102 @@ class FreeBudsController:
             self.send_command(Cmd.QUERY_PAIR), 0x2B, 0x8F, "Pair state"
         )
 
+    def run_fit_test(self) -> dict:
+        if not shutil.which("paplay") or not shutil.which("pactl"):
+            return {"success": False, "error": "Fit test requires paplay and pactl"}
+        if not self._connected or not self.mac_address:
+            return {"success": False, "error": "FreeBuds disconnected"}
+        sinks = subprocess.check_output(
+            ["pactl", "list", "short", "sinks"], text=True, timeout=5
+        )
+        address = self.mac_address.replace(":", "_").replace("-", "_").lower()
+        sink = next(
+            (
+                fields[1]
+                for row in sinks.splitlines()
+                if len(fields := row.split()) >= 2
+                and address in fields[1].lower()
+                and "bluez" in fields[1].lower()
+                and "headset" not in fields[1].lower()
+            ),
+            None,
+        )
+        if not sink:
+            return {"success": False, "error": "FreeBuds playback sink unavailable"}
+        audio = fit_audio()
+        with self._lock:
+            wearing = self.get_wearing_status() or {}
+            if not (wearing.get("left_in") and wearing.get("right_in")):
+                return {"success": False, "error": "Wear both buds for the fit test"}
+            version = self.get_fit_detect_version() or {}
+            volume_steps = 15 if version.get("value") == 1 else 8
+            player = None
+            try:
+                frames = self.send_command(Cmd.GET_FIT_CHECK, 0.5)
+                ack = self._match_frame(frames, 0x2B, 0x26)
+                if not ack or self._extract_tlv_value(ack["data"], 2) != bytes([0]):
+                    return {
+                        "success": False,
+                        "error": "Fit test start was not confirmed",
+                    }
+                player = subprocess.Popen(
+                    [
+                        "paplay",
+                        "--device",
+                        sink,
+                        "--volume",
+                        str(65536 * volume_steps // 15),
+                        str(audio),
+                    ]
+                )
+                received = b""
+                parsed_count = 0
+                deadline = time.monotonic() + 10
+                result = {}
+                while True:
+                    for frame in frames:
+                        if frame["svc"] == 0x2B and frame["cmd"] == 0x27:
+                            value = self._extract_tlv_value(frame["data"], 1)
+                            if value in (b"\x04", b"\x05"):
+                                return {
+                                    "success": False,
+                                    "error": "Acoustic interference",
+                                }
+                            if value in (b"\x00", b"\x01", b"\x02", b"\x03"):
+                                result["left" if value[0] < 2 else "right"] = (
+                                    "good" if value[0] in (0, 2) else "adjust"
+                                )
+                    playback = player.poll()
+                    if playback not in (0, None):
+                        return {"success": False, "error": "Test audio playback failed"}
+                    if playback == 0 and len(result) == 2:
+                        return {"success": True, **result}
+                    if time.monotonic() >= deadline:
+                        break
+                    self.sock.settimeout(0.25)
+                    try:
+                        chunk = self.sock.recv(4096)
+                        if not chunk:
+                            break
+                        received += chunk
+                    except socket.timeout:
+                        pass
+                    parsed = parse_frames(received)
+                    frames = [f for f in parsed[parsed_count:] if f["crc_ok"]]
+                    parsed_count = len(parsed)
+                return {"success": False, "error": "Incomplete fit report", **result}
+            finally:
+                try:
+                    if player is not None and player.poll() is None:
+                        player.terminate()
+                        try:
+                            player.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            player.kill()
+                            player.wait()
+                finally:
+                    self.exit_fit_check()
+
     def get_fit_check(self) -> Optional[dict]:
         return self._parse_uint_get(
             self.send_command(Cmd.GET_FIT_CHECK), 0x2B, 0x26, "Earplug fit check"
@@ -1553,7 +1692,7 @@ class FreeBudsController:
             result["success"] = status == 100000
             result["status"] = status
         else:
-            result["success"] = True
+            result["success"] = self._extract_tlv_value(data, 2) == bytes([2])
         log.debug(f"Fit-check exit: {result}")
         return result
 
@@ -1599,12 +1738,8 @@ class FreeBudsController:
         )
 
     def get_connect_ability(self) -> Optional[dict]:
-        return self._parse_bool_get(
-            self.send_command(Cmd.GET_CONNECT_ABILITY),
-            0x2B,
-            0x2D,
-            0x2D,
-            "Connect ability",
+        return self._parse_uint_get(
+            self.send_command(Cmd.GET_CONNECT_ABILITY), 0x2B, 0x2D, "Connect ability",
         )
 
     def _parse_bonded_device(self, data: bytes) -> dict:
@@ -1747,7 +1882,13 @@ class FreeBudsController:
             if f["svc"] == 0x2B and f["cmd"] == 0x33:
                 res = self._parse_type_operate_result(f["data"])
                 if res:
-                    return {"mac": mac, "sub": sub, **res}
+                    return {
+                        "mac": mac,
+                        "sub": sub,
+                        **res,
+                        "success": res.get("result") in (0, 100000)
+                        and res.get("type") in (None, sub),
+                    }
         if frames:
             return {"mac": mac, "sub": sub, "type": None, "result": None}
         return None
@@ -1761,6 +1902,31 @@ class FreeBudsController:
     def unpair_device(self, mac: str) -> Optional[dict]:
         return self._send_single_device_setting(3, mac)
 
+    def set_device_preference(
+        self, mac: str, preference: str, enabled: bool
+    ) -> Optional[dict]:
+        options = {
+            "reconnect": ("back_conn_permit", 4, 5),
+            "audio-switch": ("allow_audio_auto_switch", 6, 7),
+        }
+        if preference not in options or type(enabled) is not bool:
+            return None
+        field, on, off = options[preference]
+        device = next(
+            (
+                d
+                for d in self.get_bonded_devices()
+                if d["byte_addr"] == mac_to_bytes(mac)
+            ),
+            {},
+        )
+        if field not in device:
+            return {
+                "success": False,
+                "error": "Device does not advertise this preference",
+            }
+        return self._send_single_device_setting(on if enabled else off, mac)
+
     def set_primary_device(self, mac: str) -> Optional[dict]:
         mac_bytes = mac_to_bytes(mac)
         if len(mac_bytes) != 6:
@@ -1771,7 +1937,14 @@ class FreeBudsController:
             return None
         f = self._match_frame(frames, 0x2B, 0x32)
         if f:
-            return {"mac": mac, "success": True, "raw": f["data"].hex()}
+            status = self._parse_status_code(f["data"])
+            if status is not None:
+                return {"mac": mac, "success": status == 100000, "status": status}
+            success = any(
+                d["byte_addr"] == mac_bytes and d.get("primary") == 1
+                for d in self.get_bonded_devices()
+            )
+            return {"mac": mac, "success": success}
         return {"mac": mac, "success": None, "raw": frames[0]["data"].hex()}
 
     def _find_anc_mode(self, data: bytes) -> Optional[int]:
@@ -1813,7 +1986,7 @@ class FreeBudsController:
             result["mode"] = mode
             result["mode_name"] = NC_MODES[mode]
             val = self._extract_tlv_value(data, 1)
-            if val and len(val) == 2:
+            if val and len(val) == 2 and mode == NC_MODE_ON:
                 level = val[0]
                 result["level"] = level
                 result["level_name"] = NC_LEVELS.get(level, f"Unknown ({level})")
@@ -1853,6 +2026,16 @@ class FreeBudsController:
             )
         return result
 
+    def get_dynamic_anc_support(self) -> Optional[dict]:
+        reply = self._match_frame(
+            self.send_command(bytes.fromhex("2b2b0300")), 0x2B, 0x2B
+        )
+        if reply:
+            value = self._extract_tlv_value(reply["data"], 1)
+            if value in (bytes([0]), bytes([1])):
+                return {"supported": bool(value[0])}
+        return None
+
     def query_noise_reduction_mode(self) -> Optional[dict]:
         frames = self.send_command(Cmd.QUERY_NOISE_REDUCTION_MODE)
         f = self._match_frame(frames, 0x2B, 0x2A)
@@ -1864,8 +2047,16 @@ class FreeBudsController:
         for tlv in parse_tlv(data):
             v = tlv["value"]
             if tlv["tag"] == 1 and len(v) == 2:
-                result["level"] = v[0]
-                result["level_name"] = NC_LEVELS.get(v[0], f"Unknown ({v[0]})")
+                result["submode"] = v[0]
+                if v[1] == NC_MODE_ON:
+                    result["level"] = v[0]
+                    result["level_name"] = NC_LEVELS.get(v[0], f"Unknown ({v[0]})")
+                if v[1] == NC_MODE_AWARE:
+                    result["awareness_name"] = {
+                        1: "Voice enhanced",
+                        2: "Awareness",
+                        4: "Smart awareness",
+                    }.get(v[0], "Unknown")
                 result["mode"] = v[1]
                 result["mode_name"] = NC_MODES.get(v[1], f"Unknown ({v[1]})")
             elif tlv["tag"] == 2 and len(v) == 1:
@@ -1884,22 +2075,21 @@ class FreeBudsController:
             log.warning("No noise control (2B 19) response")
             return None
         data = f["data"]
-        result = {"raw": data.hex(), "source": "noise_control_lr"}
+        result = {}
         for tlv in parse_tlv(data):
-            v = tlv["value"]
-            if tlv["tag"] == 1 and len(v) == 1:
-                result["left"] = v[0]
-                result["left_name"] = NC_MODES.get(v[0], f"Unknown ({v[0]})")
-            elif tlv["tag"] == 2 and len(v) == 1:
-                result["right"] = v[0]
-                result["right_name"] = NC_MODES.get(v[0], f"Unknown ({v[0]})")
-        log.debug(f"Noise control L/R: {result}")
-        return result
+            tag, value = tlv["tag"], tlv["value"]
+            if tag in (1, 2) and len(value) == 1:
+                side = "left" if tag == 1 else "right"
+                result[side] = value[0]
+                result[side + "_name"] = NOISE_CYCLES.get(value[0], "Unknown")
+            elif tag == 3:
+                result["supported"] = list(value)
+        return result or None
 
     def get_noise_mode(self) -> Optional[dict]:
         for method in (
-            self.get_anc_state,
             self.query_noise_reduction_mode,
+            self.get_anc_state,
             self.get_anc_mode_level,
         ):
             r = method()
@@ -1921,8 +2111,6 @@ class FreeBudsController:
     ) -> Optional[dict]:
 
         f = self._match_frame(frames, svc, cmd)
-        if not f and frames:
-            f = frames[0]
         if not f:
             log.warning(f"No {name} set response")
             return None
@@ -1962,6 +2150,15 @@ class FreeBudsController:
                     f"Invalid ANC level. Valid: {', '.join(NC_LEVELS.values())} (0-3)"
                 )
                 return None
+        if mode == NC_MODE_ON and level not in (*NC_LEVELS, 255):
+            return None
+        if mode == NC_MODE_OFF and level not in (0, 255):
+            return None
+        if mode == NC_MODE_AWARE and level not in (1, 2, 255):
+            return None
+        if mode == NC_MODE_ON and level == NC_LEVEL_DYNAMIC:
+            if not (self.get_dynamic_anc_support() or {}).get("supported"):
+                return None
         frames = self.send_command(Cmd.set_anc_state_level(mode, level))
         return self._parse_anc_set_result(frames, 0x2B, 0x04, mode, "ANC state+level")
 
@@ -1972,63 +2169,40 @@ class FreeBudsController:
                 f"Invalid ANC level. Valid: {', '.join(NC_LEVELS.values())} (0-3)"
             )
             return None
-        frames = self.send_command(Cmd.set_anc_level(level))
-        f = self._match_frame(frames, 0x2B, 0x08)
-        if not f:
-            log.warning("No ANC level set response")
+        return self.set_anc_state_extended(NC_MODE_ON, level)
+
+    def set_noise_control_setting(
+        self, mode: Optional[int], value: Optional[int] = None
+    ) -> Optional[dict]:
+        requested = {
+            side: cycle
+            for side, cycle in (("left", mode), ("right", value))
+            if cycle is not None
+        }
+        if not requested or any(type(cycle) is not int for cycle in requested.values()):
             return None
-        data = f["data"]
-        result = {"level": level, "level_name": NC_LEVELS[level]}
-
-        status = self._parse_anc_status(data)
-        if status is not None:
-            ok = status in (0, 100000)
-            result["success"] = ok
-            result["status"] = status
-            if ok:
-                log.debug(f"ANC level: set to {NC_LEVELS[level]}")
-            else:
-                log.warning(f"ANC level: set failed (status=0x{status:08X})")
-        else:
-            result["success"] = None
-            log.warning(f"ANC level: unrecognized response (resp={data.hex()})")
-        return result
-
-    def set_noise_control_setting(self, mode: int, value: int = None) -> Optional[dict]:
+        state = self.get_noise_control_setting() or {}
+        if any(
+            side not in state
+            or cycle not in NOISE_CYCLES
+            or cycle not in state.get("supported", ())
+            for side, cycle in requested.items()
+        ):
+            return None
         frames = self.send_command(Cmd.set_noise_control(mode, value))
-        f = self._match_frame(frames, 0x2B, 0x18)
-        if not f:
-            log.warning("No noise control (2B 18) set response")
-            return None
-        data = f["data"]
-        result = {"mode": mode}
-
-        status = self._parse_anc_status(data)
-        if status is not None:
-            ok = status in (0, 100000)
-            result["success"] = ok
-            result["status"] = status
-            if ok:
-                log.debug(f"Noise control: set mode={mode}")
-            else:
-                log.warning(f"Noise control: set failed (status=0x{status:08X})")
-        else:
-            result["success"] = None
-            log.warning(f"Noise control: unrecognized response (resp={data.hex()})")
-        return result
+        reply = self._match_frame(frames, 0x2B, 0x18)
+        if reply:
+            status = self._parse_status_code(reply["data"])
+            if status is not None and status != 100000:
+                return {"success": False, "status": status}
+        observed = self.get_noise_control_setting() or {}
+        return {
+            **requested,
+            "success": all(observed.get(k) == v for k, v in requested.items()),
+        }
 
     def set_noise_mode(self, mode: int) -> Optional[dict]:
-        r = self.set_anc_state(mode)
-        if r is not None:
-            if r.get("success"):
-                return r
-            log.debug("Simple ANC set not confirmed, trying mode+level form...")
-            r2 = self.set_anc_state_extended(
-                mode, 0x00 if mode == NC_MODE_OFF else 0xFF
-            )
-            if r2 is not None and r2.get("success"):
-                return r2
-        return r
+        return self.set_anc_state_extended(mode, 0 if mode == NC_MODE_OFF else 255)
 
     def get_sound_effect(self) -> Optional[dict]:
         frames = self.send_command(Cmd.GET_EQ)
@@ -2075,6 +2249,9 @@ class FreeBudsController:
                 f"Invalid sound effect. Valid: {', '.join(EQ_MODES.values())} (1|2|3|9)"
             )
             return None
+        state = self.get_sound_effect() or {}
+        if "modes" in state and mode not in state["modes"]:
+            return {"success": False, "error": "EQ preset was not advertised"}
         frames = self.send_command(Cmd.set_eq(mode))
         f = self._match_frame(frames, 0x2B, 0x49)
         if not f:
@@ -2132,23 +2309,16 @@ class FreeBudsController:
         return result
 
     def set_language(self, lang_str: str) -> Optional[dict]:
-        supported = None
-        try:
-            lang_info = self.get_language_setting()
-            if lang_info and "supported" in lang_info:
-                supported = lang_info["supported"]
-                if lang_str not in supported:
-                    log.warning(f"'{lang_str}' not in supported languages: {supported}")
-        except Exception:
-            pass
+        supported = (self.get_language_setting() or {}).get("supported")
+        if supported and lang_str not in supported:
+            return {
+                "success": False,
+                "error": "Unsupported prompt language",
+                "supported": supported,
+            }
 
         frames = self.send_command(Cmd.set_language(lang_str))
         f = self._match_frame(frames, 0x0C, 0x01)
-        if not f:
-            for frame in frames:
-                if frame["svc"] == 0x0C:
-                    f = frame
-                    break
         if not f:
             log.warning("No language set response")
             return None
@@ -2171,8 +2341,8 @@ class FreeBudsController:
             else:
                 log.warning(f"Language set failed: status=0x{status:08X} ({status})")
         else:
-            result["success"] = True
-            log.debug(f"Language set: {lang_str} (raw response: {data.hex()})")
+            result["success"] = None
+            log.debug(f"Language set unconfirmed: {data.hex()}")
 
         return result
 
@@ -2241,17 +2411,13 @@ class FreeBudsController:
         info = {}
         info["battery"] = self.get_battery()
         info["version"] = self.get_version()
-        info["long_press"] = self.get_long_press_action()
-        info["pinch"] = self.get_pinch_action()
-        info["slide"] = self.get_slide_action()
-        info["double_click"] = self.get_double_click_action()
-        info["triple_click"] = self.get_triple_click_action()
-        info["light_hold"] = self.get_light_hold_action()
         info["noise_control"] = self.get_noise_control_status()
+        info.update(info["noise_control"]["details"])
+        info["noise_cycle"] = self.get_noise_control_setting()
         info["anc"] = self.get_noise_mode()
         info["sound_effect"] = self.get_sound_effect()
         info["language"] = self.get_language_setting()
-        for fkey, fentry in FEATURES.items():
+        for fkey in FEATURES:
             info[fkey] = self.get_feature(fkey)
         return info
 
@@ -2405,12 +2571,15 @@ def print_run_help():
     print("  bat                            - Get battery levels")
     print("  ver                            - Get firmware/device version")
     print("  info                           - Fetch all settings at once")
-    print("  gesture <type> [<side> <act>]  - Get/set gesture (lp|pinch|slide|dc|triple|lhold|nc)")
+    print("  gesture <type> [<side> <act>]  - Get/set gesture (lp|slide|dc|triple|nc)")
+    print("  fit                            - Run the ear-tip fit test with Huawei test audio")
+    print("  cycle [left|right <1-4>]       - Get/set long-press noise cycle")
     print("  anc [<mode>|level <name|0-3>]  - Get/set noise control (off|on|aware; level: general|cozy|ultra|dynamic)")
     print("  sfx [<name>]                   - Get/set sound effect (default|bass|treble|voices)")
     print("  lang [<code>]                  - Get/set language")
     print("  misc [<name> [on|off]]         - Get/set misc features")
     print("  devices [<action> [<mac|idx>]] - List/connect/disconnect/unpair devices stored on the buds")
+    print("  find <left|right> [ring|stop]   - Locate an earbud")
     print("  raw <hex>                      - Send raw command bytes")
     # fmt: on
 
@@ -2422,65 +2591,27 @@ def print_devices_help():
     print("  devices connect <mac|idx>     - Connect the buds to a device")
     print("  devices disconnect <mac|idx>  - Disconnect from a device")
     print("  devices unpair <mac|idx>      - Forget a device on the buds")
+    print("  devices reconnect <mac|idx> on|off   - Allow automatic reconnection")
+    print("  devices audio-switch <mac|idx> on|off - Allow automatic audio switching when supported")
     print("  devices primary <mac|idx>     - Set the default/primary device")
     # fmt: on
 
 
 def print_misc_help():
-    # fmt: off
     print("Misc settings:")
-    print("  misc <name> [on|off] - Get/set")
-    print()
-    print("  Settable:")
-    print("    greet   - Voice prompts")
-    print("    wear    - Wear detection")
-    print("    ivol    - Intellect volume")
-    print("    save    - Saving mode")
-    print("    glat    - Game low latency")
-    print("    dual    - Dual connect")
-    print("    trans   - Translate mode")
-    print("    venh    - Voice enhance")
-    print("    32k     - 32K HD voice")
-    print("    hd      - HD sound switch")
-    print("    lre     - L/R ear recognition")
-    print("    wind    - Wind mode")
-    print("    silent  - Silent upgrade")
-    print("    health  - Health alerts")
-    print()
-    print("  Read-only:")
-    print("    wearst  - Wearing status")
-    print("    dormant - Dormant time (misc dormant <seconds> sets)")
-    print("    pair    - Pair state (misc pair on enters pairing)")
-    print("    fit     - Earplug fit check (misc fit exit exits)")
-    print("    fitver  - Fit-detect version")
-    print("    hb      - Heartbeat")
-    print("    btmain  - BT main status")
-    print("    cover   - Close-cover remind")
-    print("    music   - Music mode")
-    print("    ambient - Ambient sound")
-    print("    conn    - Connect ability")
-    # fmt: on
+    for key, entry in FEATURES.items():
+        usage = " [on|off]" if "set" in entry else ""
+        print(f"  misc {key}{usage} - {entry['name']}")
 
 
 def print_gesture_help():
-    # fmt: off
-    print("Gesture commands:")
-    print("  gesture <gesture>              - Get gesture action")
-    print("  gesture <gesture> <side> <act> - Set gesture action")
-    print("  gesture nc                     - Show noise control assignments")
-    print("  gesture nc <gesture> <side>    - Assign noise control to a gesture")
-    print()
-    print("  Side: 1=left, 2=right")
-    print("  Gestures: lp (long press), pinch/sp, slide/sl, dc (double click),")
-    print("            triple/tri, lhold (light hold)")
-    print()
-    print("  Common actions: 0=Voice assistant 1=Play/Pause 2=Next 3=NC on/off 7=Previous 255=None")
-    print("  Long press extras: 10=Noise control 11=Reject call 14=Song recognition 15=Freestyle listen 17=Health query")
-    print("  Double click extras: 4=Play/Next 5=NC on/off/ambient 6=NC on/ambient 8=Play/Previous 9=NC off/ambient")
-    print("  Pinch actions: 0=Translate 1=Voice memo 2=Pairing 3=Freestyle 4=Pinch chat 5=Song recognition")
-    print("  Slide actions: 0=Volume 1=Prev/Next track")
-    print("  Triple click: 0=Assistant 1=Play/Pause 2=Next 3=NC on/off 4=Noise control")
-    # fmt: on
+    print("gesture <type> [<side 1|2> <action>]")
+    print("gesture <dc|lp> call <0=enabled|255=disabled>")
+    print("gesture slide both <action>")
+    print("gesture nc [<type> <side>]")
+    for key, entry in GESTURE_TYPES.items():
+        print(f"  {key} ({', '.join(entry['aliases'])})")
+    print("Read a gesture to list the actions advertised by the buds.")
 
 
 def run_gesture(ctrl, sub):
@@ -2495,18 +2626,23 @@ def run_gesture(ctrl, sub):
     key = GESTURE_ALIASES.get(gtype)
     if not key:
         print(
-            f"Unknown gesture '{gtype}'. Use: lp, pinch, slide, dc, triple, lhold, nc"
+            f"Unknown gesture '{gtype}'. Use: lp, slide, dc, triple, nc"
         )
         return
 
     glabel = GESTURE_TYPES[key]["name"]
-    actions = GESTURE_TYPES[key]["actions"]
     rest = sub[1:]
     if len(rest) == 0:
         r = ctrl.get_gesture_action(key)
         if r and "status" in r:
             print_status(glabel, r["status"])
         elif r:
+            if "call_action" in r:
+                print(
+                    f"In-call: {r['call_name']} (choices {r.get('call_supported', [])})"
+                )
+            if "global" in r:
+                print(f"{glabel}: both={r['global_name']}")
             lv = r.get("left")
             rv = r.get("right")
             if lv is not None or rv is not None:
@@ -2521,26 +2657,30 @@ def run_gesture(ctrl, sub):
                     else "Right=unset"
                 )
                 print(f"{glabel}: {lstr}, {rstr}")
-            elif "supported" in r:
+            if "supported" in r:
                 print(f"{glabel}: supported: {', '.join(r['supported_names'])}")
-            else:
+            elif lv is None and rv is None and "global" not in r:
                 print(f"{glabel}: {r}")
         else:
             print("no response")
     elif len(rest) == 2:
         try:
-            side = int(rest[0])
+            scope = rest[0].lower()
+            side = 0 if scope in ("both", "call") else int(scope)
             action = int(rest[1])
         except ValueError:
             print(f"Usage: gesture {gtype} <side(1|2)> <action>")
             return
-        if side not in (1, 2):
-            print("Side must be 1 (left) or 2 (right)")
+        if side not in (0, 1, 2):
+            print("Invalid side")
             return
-        r = ctrl.set_gesture_action(key, side, action)
+        if scope == "call":
+            r = ctrl.set_call_gesture(key, action)
+        else:
+            r = ctrl.set_gesture_action(key, side, action)
         if r and r.get("success"):
-            act_name = actions.get(action, f"action {action}")
-            side_name = "Left" if side == 1 else "Right"
+            act_name = r["action_name"]
+            side_name = r["side_name"]
             print(f"{glabel}: {side_name} -> {act_name}")
         elif r and "status" in r:
             print(f"{glabel}: set failed (status=0x{r['status']:08X})")
@@ -2569,7 +2709,7 @@ def run_nc(ctrl, sub):
 
     key = GESTURE_ALIASES.get(sub[0].lower())
     if not key:
-        print("Unknown gesture. Use: lp, pinch, slide, dc, triple, lhold")
+        print("Unknown gesture. Use: lp, slide, dc, triple")
         return
     if ACTION_NOISE_CONTROL.get(key) is None:
         print(f"{GESTURE_TYPES[key]['name']} has no noise-control action")
@@ -2617,31 +2757,71 @@ def cmd_run(args):
         j = i + 1
         while j < len(args.commands):
             nxt = args.commands[j].split()
-            if not nxt or nxt[0].lower() in _CMD_NAMES:
+            gesture_argument = (
+                cmd_name == "gesture"
+                and (len(parts) == 1 or (len(parts) == 2 and parts[1] == "nc"))
+                and nxt
+                and (nxt[0].lower() in GESTURE_ALIASES or nxt[0].lower() == "nc")
+            )
+            if not nxt or (
+                nxt[0].lower() in _CMD_NAMES
+                and not gesture_argument
+                and not (parts == ["misc"] and nxt[0] == "fit")
+            ):
                 break
             parts += nxt
             j += 1
         i = j
 
-        if cmd_name == "gesture":
-            run_gesture(
-                ctrl, parts[1:] or [w for tok in args.commands[i:] for w in tok.split()]
-            )
-            break
-        elif cmd_name in ("lp", "sp", "slide", "dc", "triple", "pinch", "lhold"):
-            run_gesture(ctrl, [cmd_name] + parts[1:])
-            break
-
         try:
-            if cmd_name == "help":
+            if cmd_name == "gesture":
+                run_gesture(ctrl, parts[1:])
+            elif cmd_name in GESTURE_ALIASES:
+                run_gesture(ctrl, parts)
+            elif cmd_name == "help":
                 print_run_help()
+            elif cmd_name == "fit":
+                print(ctrl.run_fit_test() if len(parts) == 1 else "Usage: fit")
+            elif cmd_name == "cycle":
+                if len(parts) == 1:
+                    print(ctrl.get_noise_control_setting() or "No response")
+                    for cycle, label in NOISE_CYCLES.items():
+                        print(f"  {cycle}  {label}")
+                elif len(parts) == 3 and parts[1] in ("left", "right"):
+                    cycle = int(parts[2])
+                    print(
+                        ctrl.set_noise_control_setting(
+                            cycle if parts[1] == "left" else None,
+                            cycle if parts[1] == "right" else None,
+                        )
+                        or "Unsupported cycle or no response"
+                    )
+                else:
+                    print("Usage: cycle [left|right <1-4>]")
+
+            elif cmd_name == "find":
+                if len(parts) not in (2, 3) or parts[1] not in ("left", "right") or (
+                    len(parts) == 3 and parts[2] not in ("ring", "stop")
+                ):
+                    print("Usage: find <left|right> [ring|stop]")
+                else:
+                    ring = parts[2] == "ring" if len(parts) == 3 else None
+                    result = ctrl.locator(parts[1], ring)
+                    if result and result.get("success"):
+                        print(f"{parts[1]}: {'ringing' if result['ringing'] else 'silent'}")
+                    else:
+                        print((result or {}).get("error", "Locator request unconfirmed"))
 
             elif cmd_name == "bat":
                 b = ctrl.get_battery()
                 if b:
-                    print(
-                        f"L:{b.get('left_battery', '?')}%  R:{b.get('right_battery', '?')}%  Box:{b.get('box_battery', '?')}%"
-                    )
+                    labels = []
+                    for side in ("left", "right", "box"):
+                        level = b.get(side + "_battery")
+                        display = f"{level}%" if level is not None and level <= 100 else "unknown"
+                        charging = " (charging)" if b.get(side + "_charging") else ""
+                        labels.append(f"{side.title()}: {display}{charging}")
+                    print("  ".join(labels))
                 else:
                     print("no response")
 
@@ -2715,7 +2895,9 @@ def cmd_run(args):
                 else:
                     r = ctrl.get_noise_mode()
                     if r and "mode" in r:
-                        print(f"Noise control: {r['mode_name']}")
+                        detail = r.get("level_name") or r.get("awareness_name")
+                        suffix = f" ({detail})" if detail and detail != r["mode_name"] else ""
+                        print(f"Noise control: {r['mode_name']}{suffix}")
                     elif r:
                         print(
                             f"Noise control: raw={r.get('raw', '?')} "
@@ -2758,31 +2940,8 @@ def cmd_run(args):
                 fname = parts[1].lower()
                 if fname in ("help", "-h"):
                     print_misc_help()
-                elif fname == "dormant" and len(parts) >= 3:
-                    try:
-                        seconds = int(parts[2])
-                    except ValueError:
-                        print("Usage: misc dormant <seconds>")
-                        continue
-                    r = ctrl.set_dormant_time(0, seconds)
-                    if r and r.get("success"):
-                        print(f"Dormant time: set to {seconds}s")
-                    elif r:
-                        print(f"Dormant time: set failed ({r})")
-                    else:
-                        print("no response")
-                elif (
-                    fname == "pair"
-                    and len(parts) >= 3
-                    and parts[2].lower() in ("on", "1", "true", "yes")
-                ):
-                    r = ctrl.start_pair()
-                    if r and r.get("success"):
-                        print("Pairing mode: enabled")
-                    elif r:
-                        print(f"Pairing mode: set failed ({r})")
-                    else:
-                        print("no response")
+                elif fname == "fit" and len(parts) == 2:
+                    print(ctrl.run_fit_test())
                 elif fname == "fit" and len(parts) >= 3 and parts[2].lower() == "exit":
                     r = ctrl.exit_fit_check()
                     if r and r.get("success"):
@@ -2863,15 +3022,31 @@ def cmd_run(args):
                             f"{d.get('addr', '?')} - {state}{prim}"
                         )
                 elif len(parts) >= 3:
-                    if action not in ("connect", "disconnect", "unpair", "primary"):
+                    if action not in (
+                        "connect",
+                        "disconnect",
+                        "unpair",
+                        "primary",
+                        "reconnect",
+                        "audio-switch",
+                    ):
                         print(f"Unknown devices action '{parts[1]}'. Use: devices help")
                     else:
                         mac = ctrl._resolve_bonded_mac(parts[2])
                         if not mac:
                             print(f"Unknown device '{parts[2]}'")
+                        elif action in ("reconnect", "audio-switch"):
+                            if len(parts) == 4 and parts[3] in ("on", "off"):
+                                print(
+                                    ctrl.set_device_preference(
+                                        mac, action, parts[3] == "on"
+                                    )
+                                )
+                            else:
+                                print(f"Usage: devices {action} <mac|idx> on|off")
                         elif action == "connect":
                             r = ctrl.connect_device(mac)
-                            if r and r.get("result") in (0, 100000):
+                            if r and r.get("success"):
                                 print(f"Connected {mac}")
                             elif r:
                                 print(f"Connect failed: result={r.get('result')}")
@@ -2879,7 +3054,7 @@ def cmd_run(args):
                                 print("no response")
                         elif action == "disconnect":
                             r = ctrl.disconnect_device(mac)
-                            if r and r.get("result") in (0, 100000):
+                            if r and r.get("success"):
                                 print(f"Disconnected {mac}")
                             elif r:
                                 print(f"Disconnect failed: result={r.get('result')}")
@@ -2887,7 +3062,7 @@ def cmd_run(args):
                                 print("no response")
                         elif action == "unpair":
                             r = ctrl.unpair_device(mac)
-                            if r and r.get("result") in (0, 100000):
+                            if r and r.get("success"):
                                 print(f"Unpaired {mac}")
                             elif r:
                                 print(f"Unpair failed: result={r.get('result')}")
@@ -2980,7 +3155,7 @@ def main():
     p.add_argument(
         "commands",
         nargs="*",
-        help="Commands to run (e.g. 'bat' 'lang' 'greet on' 'anc off')",
+        help="Commands to run (e.g. 'bat' 'lang' 'misc wear on' 'anc off')",
     )
     p.add_argument("-t", "--timeout", type=float, default=2.0)
 
